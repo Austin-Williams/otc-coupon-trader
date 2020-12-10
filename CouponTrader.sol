@@ -26,7 +26,7 @@ contract CouponTrader {
         address buyer;
         uint256 epoch;
         uint256 numCoupons;
-        uint256 price; // in USDC -- recall that USD uses 6 decimals, not 18
+        uint256 price; // in USDC -- recall that USDC uses 6 decimals, not 18
     }
     
     mapping (address => Offer) private offerBySeller;
