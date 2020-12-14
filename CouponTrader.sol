@@ -1,7 +1,28 @@
 pragma solidity 0.7.5;
+pragma experimental ABIEncoderV2;
 // SPDX-License-Identifier: MIT
 
-// Deployed on mainnet at: 0x53e355a36482A3AF1E58ADbdb28D491f51fEd47F
+/**
+Copyright (c) 2020 Austin Williams
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+**/
 
 interface IESDS {
     function transferCoupons(address _sender, address _recipient, uint256 _epoch, uint256 _amount) external;
@@ -10,7 +31,9 @@ interface IESDS {
 }
 
 interface IERC20 {
-    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+    function transferFrom(address _sender, address _recipient, uint256 _amount) external returns (bool);
+    function balanceOf(address _account) external view returns (uint256);
+    function allowance(address _owner, address _spender) external view returns (uint256);
 }
 
 contract CouponTrader {
@@ -23,16 +46,20 @@ contract CouponTrader {
     address public house = 0xE1dba80BAc43407360c7b0175444893eBaA30098; // collector of house take
     
     struct Offer {
-        address buyer;
+        address buyer; // use OPEN_SALE_INDICATOR as the buyer address if you want to allow anyone to take the offer
         uint256 epoch;
-        uint256 numCoupons;
-        uint256 price; // in USDC -- recall that USDC uses 6 decimals, not 18
+        uint256 numCoupons; // 18 decimals
+        uint256 totalUSDCRequiredFromSeller; // 6 decimals
     }
     
     mapping (address => Offer) private offerBySeller;
     
-    event OfferSet(address indexed seller, address indexed buyer, uint256 indexed epoch, uint256 numCoupons, uint256 price);
-    event SuccessfulTrade(address indexed seller, address indexed buyer, uint256 epoch, uint256 numCoupons, uint256 price);
+    event OfferSet(address indexed seller, address indexed buyer, uint256 indexed epoch, uint256 numCoupons, uint256 totalUSDCRequiredFromSeller);
+    event SuccessfulTrade(address indexed seller, address indexed buyer, uint256 epoch, uint256 numCoupons, uint256 totalUSDCRequiredFromSeller);
+    
+    /** ======================== 
+        STATE MUTATING FUNCTIONS
+        ======================== **/
     
     // @notice Allows a seller to set or update an offer
     // @notice Caller MUST have approved this contract to move their coupons before calling this function or else this will revert.
@@ -42,18 +69,18 @@ contract CouponTrader {
     //    anyone can take this offer.
     // @param _epoch The epoch of the coupons to be sold.
     // @param _numCoupons The number of coupons to be sold.
-    // @param _price The amount of USDC the buyer must pay to take this offer. Remember that USDC uses 6 decimal places, not 18.
-    function setOffer(address _buyer, uint256 _epoch, uint256 _numCoupons, uint256 _price) external {
+    // @param _totalUSDCRequiredFromSeller The amount of USDC the buyer must pay to take this offer. Remember that USDC uses 6 decimal places, not 18.
+    function setOffer(address _buyer, uint256 _epoch, uint256 _numCoupons, uint256 _totalUSDCRequiredFromSeller) external {
         // sanity checks
         require(ESDS.balanceOfCoupons(msg.sender, _epoch) >= _numCoupons, "seller doesn't have enough coupons at that epoch");
         require(ESDS.allowanceCoupons(msg.sender, address(this)) >= _numCoupons, "seller hasn't approved this contract to move enough coupons");
-        require(_price > 0, "zero price");
+        require(_totalUSDCRequiredFromSeller > 0, "_totalUSDCRequiredFromSeller is zero -- use the revokeOffer function");
         
         // store new offer
-        Offer memory newOffer = Offer(_buyer, _epoch, _numCoupons, _price);
+        Offer memory newOffer = Offer(_buyer, _epoch, _numCoupons, _totalUSDCRequiredFromSeller);
         offerBySeller[msg.sender] = newOffer;
         
-        emit OfferSet(msg.sender, _buyer, _epoch, _numCoupons, _price);
+        emit OfferSet(msg.sender, _buyer, _epoch, _numCoupons, _totalUSDCRequiredFromSeller);
     }
     
     // @notice A convenience function a seller can use to revoke their offer.
@@ -62,21 +89,14 @@ contract CouponTrader {
         emit OfferSet(msg.sender, address(0), 0, 0, 0);
     }
     
-    // @notice A getter for the offers
-    // @param _seller The address of the seller whose offer we want to return.
-    function getOffer(address _seller) external view returns (address, uint256, uint256, uint256) {
-        Offer memory offer = offerBySeller[_seller];
-        return (offer.buyer, offer.epoch, offer.numCoupons, offer.price);
-    }
-    
     // @notice Allows a buyer to take an offer.
     // @dev Partial fills are not supported.
     // @dev The buyer must have approved this contract to move enough USDC to pay for this purchase.
     // @param _seller The seller whose offer the caller wants to take.
     // @param _epoch The epoch of the coupons being bought (must match the seller's offer). 
     // @param _numCoupons The number of coupons being bought (must match the seller's offer).
-    // @param _price The amount of USDC the buyer is paying (must match the seller's offer).
-    function takeOffer(address _seller, uint256 _epoch, uint256 _numCoupons, uint256 _price) external {
+    // @param _totalUSDCRequiredFromSeller The amount of USDC the buyer is paying (must match the seller's offer).
+    function takeOffer(address _seller, uint256 _epoch, uint256 _numCoupons, uint256 _totalUSDCRequiredFromSeller) external {
         // get offer information
         Offer memory offer = offerBySeller[_seller];
         
@@ -87,7 +107,7 @@ contract CouponTrader {
         require(
             offer.epoch == _epoch &&
             offer.numCoupons == _numCoupons &&
-            offer.price == _price,
+            offer.totalUSDCRequiredFromSeller == _totalUSDCRequiredFromSeller,
             "order details do not match the seller's offer"
         );
         
@@ -95,8 +115,8 @@ contract CouponTrader {
         delete offerBySeller[_seller];
         
         // compute house take and seller take (USDC)
-        uint256 houseTake = offer.price.mul(HOUSE_RATE).div(10_000);
-        uint256 sellerTake = offer.price.sub(houseTake);
+        uint256 houseTake = offer.totalUSDCRequiredFromSeller.mul(HOUSE_RATE).div(10_000);
+        uint256 sellerTake = offer.totalUSDCRequiredFromSeller.sub(houseTake);
         
         // pay the seller USDC
         require(USDC.transferFrom(msg.sender, _seller, sellerTake), "could not pay seller");
@@ -108,7 +128,7 @@ contract CouponTrader {
         ESDS.transferCoupons(_seller, msg.sender, _epoch, _numCoupons); // @audit-ok reverts on failure
         
         // emit events
-        emit SuccessfulTrade(_seller, msg.sender, _epoch, _numCoupons, _price);
+        emit SuccessfulTrade(_seller, msg.sender, _epoch, _numCoupons, _totalUSDCRequiredFromSeller);
         emit OfferSet(_seller, address(0), 0, 0, 0);
     }
     
@@ -116,6 +136,79 @@ contract CouponTrader {
     function changeHouseAddress(address _newAddress) external {
         require(msg.sender == house);
         house = _newAddress;
+    }
+    
+    /** ======================
+        NON-MUTATING FUNCTIONS
+        ====================== **/
+    
+    // @notice A getter for the offers
+    // @param _seller The address of the seller whose offer we want to return.
+    function getOffer(address _seller) external view returns (address, uint256, uint256, uint256) {
+        Offer memory offer = offerBySeller[_seller];
+        return (offer.buyer, offer.epoch, offer.numCoupons, offer.totalUSDCRequiredFromSeller);
+    }
+    
+    // @notice Returns true iff the _buyer is authorized to take the _offer offer.
+    function isAuthorizedBuyer(Offer memory _offer, address _buyer) public pure returns (bool) {
+        return ( _buyer == _offer.buyer || _offer.buyer == OPEN_SALE_INDICATOR );
+    }
+    
+    // @notice Returns true iff all the details passed match the _offer.
+    function detailsMatch(Offer memory _offer, uint256 _epoch, uint256 _numCoupons, uint256 _totalUSDCRequiredFromSeller) public pure returns (bool) {
+        return (
+            _offer.epoch == _epoch &&
+            _offer.numCoupons == _numCoupons &&
+            _offer.totalUSDCRequiredFromSeller == _totalUSDCRequiredFromSeller
+        );
+    }
+    
+    // @notice Returns true iff the _seller holds at least _numCoupons coupons.
+    function sellerHasTheCoupons(address _seller, uint256 _epoch, uint256 _numCoupons) public view returns (bool) {
+        return ( ESDS.balanceOfCoupons(_seller, _epoch) >= _numCoupons );
+    }
+    
+    // @notice Returns true iff the _seller has approve this contract to move at least _numCoupons coupons.
+    function sellerHasApprovedCoupons(address _seller, uint256 _numCoupons) public view returns (bool) {
+        return ( ESDS.allowanceCoupons(_seller, address(this)) >= _numCoupons );
+    }
+    
+    // @notice Returns true iff the _buyer holds at least _totalUSDCRequiredFromSeller USDC.
+    function buyerHasTheUSDC(address _buyer, uint256 _totalUSDCRequiredFromSeller) public view returns (bool) {
+        return ( USDC.balanceOf(_buyer) >= _totalUSDCRequiredFromSeller );
+    }
+    
+    // @notice Returns true iff the _buyer has approve this contract to move at least _totalUSDCRequiredFromSeller USDC.
+    function buyerHasApprovedUSDC(address _buyer, uint256 _totalUSDCRequiredFromSeller) public view returns (bool) {
+        return ( USDC.allowance(_buyer, address(this)) >= _totalUSDCRequiredFromSeller );
+    }
+    
+    // @notice Returns true iff the entered offer would likely succeed if taken by the _buyer right now.
+    // @dev This is just for UI convenience. It should not be relied upon for anything security-related.
+    function tradeShouldSucceed(address _buyer, address _seller, uint256 _epoch, uint256 _numCoupons, uint256 _totalUSDCRequiredFromSeller)
+        external
+        view
+        returns (bool)
+    {
+        Offer memory offer = offerBySeller[_seller];
+
+        return (
+            isAuthorizedBuyer(offer, _buyer) &&
+            detailsMatch(offer, _epoch, _numCoupons, _totalUSDCRequiredFromSeller) &&
+            sellerHasTheCoupons(_seller, _epoch, _numCoupons) &&
+            sellerHasApprovedCoupons(_seller, _numCoupons) &&
+            buyerHasTheUSDC(_buyer, _totalUSDCRequiredFromSeller) &&
+            buyerHasApprovedUSDC(_buyer, _totalUSDCRequiredFromSeller)
+        );
+    }
+    
+    // @notice Convenience function for encoding offers.
+    function offerEncoder(address _buyer, uint256 _epoch, uint256 _numCoupons, uint256 _totalUSDCRequiredFromSeller)
+        external
+        pure
+        returns (Offer memory)
+    {
+        return Offer(_buyer, _epoch, _numCoupons, _totalUSDCRequiredFromSeller);   
     }
     
 }
